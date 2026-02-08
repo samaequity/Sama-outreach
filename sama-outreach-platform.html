@@ -675,6 +675,13 @@
           <p class="page-subtitle">Overview of your outreach performance</p>
         </div>
 
+        <div style="margin-bottom: 1.5rem;">
+          <button class="btn btn-primary" onclick="syncInbox()" id="syncInboxBtn">
+            🔄 Sync Inbox for Replies
+          </button>
+          <span id="lastSyncTime" style="margin-left: 1rem; color: var(--text-secondary); font-size: 0.9rem;"></span>
+        </div>
+
         <div class="stats-grid">
           <div class="stat-card">
             <div class="stat-value" id="totalContacts">0</div>
@@ -702,6 +709,13 @@
             <h3 class="card-title">Recent Campaigns</h3>
           </div>
           <div id="recentCampaignsTable"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <h3 class="card-title">Recent Replies</h3>
+          </div>
+          <div id="recentRepliesContainer"></div>
         </div>
       </div>
 
@@ -1225,6 +1239,106 @@
       }
 
       return true;
+    }
+
+    async function syncInbox() {
+      const auth = storage.get('msftAuth');
+      
+      if (!auth || Date.now() > auth.expiresAt) {
+        alert('Please connect Microsoft 365 in Settings first.');
+        return;
+      }
+
+      const btn = document.getElementById('syncInboxBtn');
+      btn.disabled = true;
+      btn.textContent = '🔄 Syncing...';
+
+      try {
+        // Get emails from the last 30 days
+        const thirtyDaysAgo = new Date();
+        thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+        const filterDate = thirtyDaysAgo.toISOString();
+
+        const response = await fetch(
+          `https://graph.microsoft.com/v1.0/me/messages?$filter=receivedDateTime ge ${filterDate}&$top=100&$select=from,subject,receivedDateTime,isRead`,
+          {
+            headers: {
+              'Authorization': `Bearer ${auth.accessToken}`
+            }
+          }
+        );
+
+        if (!response.ok) {
+          throw new Error('Failed to fetch emails');
+        }
+
+        const data = await response.json();
+        const contacts = storage.get('contacts');
+        let newReplies = 0;
+
+        // Check each email against our contacts
+        data.value.forEach(email => {
+          const senderEmail = email.from.emailAddress.address.toLowerCase();
+          const contact = contacts.find(c => c.email.toLowerCase() === senderEmail);
+          
+          if (contact) {
+            // Check if we've already logged this reply
+            const activity = storage.get('emailActivity') || [];
+            const alreadyLogged = activity.find(a => 
+              a.contactEmail === contact.email && 
+              a.type === 'email_received' &&
+              Math.abs(new Date(a.timestamp) - new Date(email.receivedDateTime)) < 1000
+            );
+
+            if (!alreadyLogged) {
+              logEmailActivity(contact.email, 'email_received', email.subject);
+              newReplies++;
+            }
+          }
+        });
+
+        storage.set('lastSyncTime', new Date().toISOString());
+        
+        btn.disabled = false;
+        btn.textContent = '🔄 Sync Inbox for Replies';
+        
+        if (newReplies > 0) {
+          alert(`✅ Found ${newReplies} new ${newReplies === 1 ? 'reply' : 'replies'}!\n\nContact statuses have been updated.`);
+        } else {
+          alert('✅ Inbox synced! No new replies found.');
+        }
+        
+        updateDashboard();
+        updateLastSyncTime();
+        
+      } catch (error) {
+        btn.disabled = false;
+        btn.textContent = '🔄 Sync Inbox for Replies';
+        alert('Error syncing inbox: ' + error.message);
+      }
+    }
+
+    function updateLastSyncTime() {
+      const lastSync = storage.get('lastSyncTime');
+      const element = document.getElementById('lastSyncTime');
+      
+      if (lastSync) {
+        const date = new Date(lastSync);
+        const now = new Date();
+        const diffMinutes = Math.floor((now - date) / 60000);
+        
+        let timeStr;
+        if (diffMinutes < 1) {
+          timeStr = 'Just now';
+        } else if (diffMinutes < 60) {
+          timeStr = `${diffMinutes} ${diffMinutes === 1 ? 'minute' : 'minutes'} ago`;
+        } else {
+          const diffHours = Math.floor(diffMinutes / 60);
+          timeStr = `${diffHours} ${diffHours === 1 ? 'hour' : 'hours'} ago`;
+        }
+        
+        element.textContent = `Last synced: ${timeStr}`;
+      }
     }
 
     // Initialize storage
@@ -1773,7 +1887,12 @@
       
       const totalSent = campaigns.reduce((sum, c) => sum + (c.sent || 0), 0);
       const totalReplied = campaigns.reduce((sum, c) => sum + (c.replied || 0), 0);
-      const responseRate = totalSent > 0 ? ((totalReplied / totalSent) * 100).toFixed(1) : 0;
+      
+      // Count actual replies from email activity
+      const activity = storage.get('emailActivity') || [];
+      const actualReplies = activity.filter(a => a.type === 'email_received').length;
+      
+      const responseRate = totalSent > 0 ? ((actualReplies / totalSent) * 100).toFixed(1) : 0;
 
       document.getElementById('totalContacts').textContent = contacts.length;
       document.getElementById('activeCampaigns').textContent = activeCampaigns.length;
@@ -1810,6 +1929,56 @@
       ` : '<div class="empty-state"><div class="empty-state-icon">📭</div><div class="empty-state-title">No campaigns yet</div><p>Create your first campaign to get started</p></div>';
       
       document.getElementById('recentCampaignsTable').innerHTML = tableHtml;
+
+      // Recent replies
+      const recentReplies = activity
+        .filter(a => a.type === 'email_received')
+        .slice(-10)
+        .reverse();
+      
+      const repliesHtml = recentReplies.length > 0 ? `
+        <div class="table-container">
+          <table>
+            <thead>
+              <tr>
+                <th>Contact</th>
+                <th>Subject</th>
+                <th>Received</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${recentReplies.map(r => {
+                const contact = contacts.find(c => c.email === r.contactEmail);
+                const timeAgo = getTimeAgo(new Date(r.timestamp));
+                return `
+                  <tr>
+                    <td>${contact ? contact.name : r.contactEmail}</td>
+                    <td>${r.subject || 'No subject'}</td>
+                    <td>${timeAgo}</td>
+                  </tr>
+                `;
+              }).join('')}
+            </tbody>
+          </table>
+        </div>
+      ` : '<div class="empty-state"><div class="empty-state-icon">📬</div><div class="empty-state-title">No replies yet</div><p>Click "Sync Inbox" to check for replies</p></div>';
+      
+      document.getElementById('recentRepliesContainer').innerHTML = repliesHtml;
+      
+      updateLastSyncTime();
+    }
+
+    function getTimeAgo(date) {
+      const now = new Date();
+      const diffMs = now - date;
+      const diffMins = Math.floor(diffMs / 60000);
+      const diffHours = Math.floor(diffMins / 60);
+      const diffDays = Math.floor(diffHours / 24);
+      
+      if (diffMins < 1) return 'Just now';
+      if (diffMins < 60) return `${diffMins}m ago`;
+      if (diffHours < 24) return `${diffHours}h ago`;
+      return `${diffDays}d ago`;
     }
 
     function renderContacts() {
