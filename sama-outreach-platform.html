@@ -1746,9 +1746,19 @@ Hassan"></textarea>
 
       campaign.status = 'active';
       const contacts = storage.get('contacts');
-      const targetContacts = campaign.segment === 'all' 
+      
+      // Filter by segment AND exclude already contacted people
+      let targetContacts = campaign.segment === 'all' 
         ? contacts 
         : contacts.filter(c => c.segment === campaign.segment);
+      
+      // CRITICAL: Exclude contacts already reached out to (to avoid double-emailing)
+      targetContacts = targetContacts.filter(c => c.status === 'prospect');
+      
+      if (targetContacts.length === 0) {
+        alert('No prospects to email! All contacts in this segment have already been reached out to.');
+        return;
+      }
       
       const templates = storage.get('templates');
       const template = templates.find(t => t.id === campaign.templateId);
