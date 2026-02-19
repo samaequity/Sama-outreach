@@ -1010,9 +1010,15 @@
           </div>
           <div class="form-group">
             <label class="form-label">Email Body *</label>
-            <textarea class="form-textarea" id="templateBody" required></textarea>
+            <textarea class="form-textarea" id="templateBody" required placeholder="Hi {{name}},
+
+I came across {{company}} and was impressed...
+
+Best,
+Hassan"></textarea>
             <div class="help-text">
-              Available merge fields: {{name}}, {{company}}, {{title}}, {{location}}, {{email}}
+              Available merge fields: {{name}}, {{company}}, {{title}}, {{location}}, {{email}}<br>
+              <strong>Tip:</strong> Press Enter for line breaks. They will be preserved in the email.
             </div>
           </div>
         </form>
@@ -1214,12 +1220,18 @@
         throw new Error('Microsoft authentication expired. Please reconnect.');
       }
 
+      // Convert plain text line breaks to HTML
+      const htmlBody = body
+        .replace(/\n/g, '<br>')
+        .replace(/\r\n/g, '<br>')
+        .replace(/\r/g, '<br>');
+
       const message = {
         message: {
           subject: subject,
           body: {
             contentType: 'HTML',
-            content: body
+            content: htmlBody
           },
           toRecipients: [{ emailAddress: { address: to } }]
         }
@@ -1235,7 +1247,8 @@
       });
 
       if (!response.ok) {
-        throw new Error('Failed to send email');
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.error?.message || 'Failed to send email');
       }
 
       return true;
@@ -1749,32 +1762,8 @@
       const useMicrosoft = auth && Date.now() < auth.expiresAt;
 
       if (useMicrosoft) {
-        // Send real emails via Microsoft
-        let sentCount = 0;
-        const sendPromises = targetContacts.map(async (contact) => {
-          try {
-            const personalizedSubject = personalizeText(template.subject, contact);
-            const personalizedBody = personalizeText(template.body, contact);
-            
-            await sendEmailViaMicrosoft(contact.email, personalizedSubject, personalizedBody);
-            logEmailActivity(contact.email, 'email_sent', personalizedSubject);
-            sentCount++;
-          } catch (error) {
-            console.error('Error sending to ' + contact.email, error);
-          }
-        });
-        
-        Promise.all(sendPromises).then(() => {
-          campaign.sent = sentCount;
-          storage.set('campaigns', campaigns);
-          loadPageData('campaigns');
-          updateDashboard();
-          // Refresh contacts to show updated statuses
-          if (document.getElementById('contacts').classList.contains('active')) {
-            loadPageData('contacts');
-          }
-          alert(`Campaign launched! ${sentCount} emails sent via Microsoft 365.\n\nContact statuses have been updated to "Reached Out".`);
-        });
+        // Send real emails via Microsoft with rate limiting
+        sendEmailsWithRateLimit(targetContacts, template, campaign, campaigns);
       } else {
         // Simulate email sending and update statuses
         targetContacts.forEach(contact => {
@@ -1790,6 +1779,81 @@
           loadPageData('contacts');
         }
         alert(`Campaign launched! ${targetContacts.length} emails queued.\n\nContact statuses have been updated to "Reached Out".\n\nConnect Microsoft 365 in Settings to send real emails.`);
+      }
+    }
+
+    async function sendEmailsWithRateLimit(targetContacts, template, campaign, campaigns) {
+      // Show progress modal
+      const progressModal = document.createElement('div');
+      progressModal.style.cssText = 'position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); z-index: 10000; display: flex; align-items: center; justify-content: center;';
+      progressModal.innerHTML = `
+        <div style="background: var(--bg-secondary); padding: 2rem; border-radius: 12px; border: 1px solid var(--border-color); min-width: 400px;">
+          <h3 style="color: var(--text-primary); margin-bottom: 1rem;">Sending Emails...</h3>
+          <div style="color: var(--text-secondary); margin-bottom: 1rem;">
+            <span id="progressText">Sending 0 of ${targetContacts.length}</span>
+          </div>
+          <div class="progress-bar">
+            <div class="progress-fill" id="progressFill" style="width: 0%"></div>
+          </div>
+          <p style="color: var(--text-secondary); font-size: 0.85rem; margin-top: 1rem;">Please keep this window open...</p>
+        </div>
+      `;
+      document.body.appendChild(progressModal);
+
+      let sentCount = 0;
+      let failedCount = 0;
+      
+      // Send emails with 500ms delay between each (max ~120 emails per minute)
+      for (let i = 0; i < targetContacts.length; i++) {
+        const contact = targetContacts[i];
+        
+        try {
+          const personalizedSubject = personalizeText(template.subject, contact);
+          const personalizedBody = personalizeText(template.body, contact);
+          
+          await sendEmailViaMicrosoft(contact.email, personalizedSubject, personalizedBody);
+          logEmailActivity(contact.email, 'email_sent', personalizedSubject);
+          sentCount++;
+          
+          // Update progress
+          document.getElementById('progressText').textContent = `Sent ${sentCount} of ${targetContacts.length}`;
+          document.getElementById('progressFill').style.width = `${(sentCount / targetContacts.length) * 100}%`;
+          
+          // Wait 500ms before next email (rate limiting)
+          if (i < targetContacts.length - 1) {
+            await new Promise(resolve => setTimeout(resolve, 500));
+          }
+        } catch (error) {
+          console.error('Error sending to ' + contact.email, error);
+          failedCount++;
+          
+          // If we hit rate limit, wait longer
+          if (error.message.includes('429') || error.message.includes('throttle')) {
+            console.log('Rate limit hit, waiting 5 seconds...');
+            await new Promise(resolve => setTimeout(resolve, 5000));
+          }
+        }
+      }
+      
+      // Remove progress modal
+      document.body.removeChild(progressModal);
+      
+      // Update campaign
+      campaign.sent = sentCount;
+      storage.set('campaigns', campaigns);
+      loadPageData('campaigns');
+      updateDashboard();
+      
+      // Refresh contacts to show updated statuses
+      if (document.getElementById('contacts').classList.contains('active')) {
+        loadPageData('contacts');
+      }
+      
+      // Show results
+      if (failedCount > 0) {
+        alert(`Campaign complete!\n\n✅ Successfully sent: ${sentCount}\n❌ Failed: ${failedCount}\n\nContact statuses have been updated to "Reached Out".`);
+      } else {
+        alert(`Campaign launched! ${sentCount} emails sent via Microsoft 365.\n\nContact statuses have been updated to "Reached Out".`);
       }
     }
 
